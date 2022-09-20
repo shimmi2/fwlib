@@ -1,5 +1,5 @@
 {
-    "name": "root/fwlib",
+    "name": "tsimek/fwlib",
     "description": "FWLIB - 15+ years rolling base libs for multipple projects",
     "type": "library",
     "require": {
