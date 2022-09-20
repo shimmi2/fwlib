@@ -1,0 +1,231 @@
+<?PHP
+
+function get_old_session_taco(&$sid) {
+	return(db_trivialquery("SELECT CONCAT(us_tarif, '.', IFNULL(GROUP_CONCAT(up_tarif), '-')) AS tacombo FROM users LEFT JOIN user_packages ON up_user=us_id WHERE us_id=$sid->ses_uid", 'get use tacombo'));
+}
+
+function json_out(&$data) {
+	header('Content-Type: application/json');
+	echo json_encode($data);
+}
+
+function throw_error($http_code, $err, $body='') {
+	$err=trim($err);
+	header("HTTP/1.0 $http_code $err");
+	if (!$body) $body=$err;
+	echo "$body\n";
+	exit;
+}
+
+function cipher_output($out) {
+	return($out);
+}
+
+function norm_taco($taco){
+	$taco=str_replace('.', ',', str_replace('-', '', $taco));
+	$taco=preg_replace('/\,$/', '', $taco);
+	return($taco);
+}
+
+function right_get_contents($uri) {
+	$page=file_get_contents($uri);
+	if (in_array('content-encoding: gzip', $http_response_header) || 
+		in_array('Content-Encoding: gzip', $http_response_header)) {
+		tolog("content-encoding: gzip", L_DEBUG1);
+		return(gzdecode($page));
+	}
+	return($page);
+}
+
+
+function secure_conn() {
+    if ((!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || 
+		(!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] == 'https') || 
+		(!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && $_SERVER['HTTP_X_FORWARDED_SSL'] == 'on') || 
+		(isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443) || 
+		(isset($_SERVER['HTTP_X_FORWARDED_PORT']) && $_SERVER['HTTP_X_FORWARDED_PORT'] == 443) || 
+		(isset($_SERVER['REQUEST_SCHEME']) && $_SERVER['REQUEST_SCHEME'] == 'https')) 
+		return (TRUE); 
+	else 
+		return (FALSE);
+}
+if (!function_exists('connect_redis')) {
+function connect_redis() {
+	global $redis, $redis_host, $redis_pass;
+	$redis=new Redis();
+	$redis->pconnect($redis_host);
+	$redis->auth($redis_pass);
+}
+}
+
+if (!function_exists('connect_redis_write')) {
+function connect_redis_write() {
+	global $redis, $redis_write, $redis_host_write, $redis_pass_write;
+	if (isset($redis_write) && $redis_write) return;
+	if (isset($redis_host_write)) {
+		$redis_write=new Redis();
+		$redis_write->pconnect($redis_host_write);
+		if ($redis_pass_write) $redis_write->auth($redis_pass_write);
+	} else $redis_write=$redis;
+}
+}
+
+define('V_INT', 1);
+define('V_ID', 6);
+define('V_FLOAT', 2);
+define('V_BOOL', 3);
+define('V_STR', 4);
+define('V_ISSET', 5);
+
+define('V_MUST', 256);
+
+function import_var($varname, $type, $default=NULL) {
+	if ($type & V_MUST && !isset($_REQUEST[$varname])) throw_error(400, "required variable $varname not sent");
+	if (!isset($_REQUEST[$varname])) return($default);
+	$t=$type & 255;
+	switch ($t) {
+		case V_INT:
+			return(intval($_REQUEST[$varname]));
+		case V_ID:
+			$id=intval($_REQUEST[$varname]);
+			if (!$id) throw_error(400, "required variable $varname is NULL");
+			return($id);
+		case V_FLOAT:
+			return(floatval($_REQUEST[$varname]));
+		case V_BOOL:
+			return(boolval($_REQUEST[$varname]));
+		case V_STR:
+			return(strval($_REQUEST[$varname]));
+		case V_ISSET:
+			return(isset($_REQUEST[$varname]) && boolval($_REQUEST[$varname]));
+		default:
+			throw_error(500, "import_var: invalid parameter type requested");
+	}
+}
+
+function deploy_data($path, $data, $check_same=TRUE, $log_param=0) {
+//echo "deploy_data($path, data, $check_same, $log_param)\n";
+	if ($check_same && file_exists($path) && file_get_contents($path)==$data) {
+		tolog("not writing $path, file unchanged", L_DEBUG);
+		return(FALSE);
+	}
+	$dir=dirname($path);
+	if (!file_exists($dir)) {
+		tolog("creating directory $dir", L_DEBUG);
+		if (!mkdir ($dir , 0755, TRUE)) tolog ("failed mkdir '$dir'", L_ERR);
+	}
+	
+	if (!file_put_contents("$path.new", $data))
+    tolog("failed to deploy file $path", L_ERR | $ignore);
+	
+	if (!copy("$path", "$path.1"))
+    tolog("failed to backup file as $path.new.1", L_WARN);
+
+	if (!rename("$path.new", "$path"))
+    tolog("failed to rename $path.1 as $path", L_WARN);
+	return(TRUE);
+}
+
+/*
+	// local deploy for this time
+	if ($compress) {
+		$path.='.gz';
+		$json=gzencode(cipher_output(json_encode($data, JSON_PRETTY_PRINT)));
+//		$json=gzencode(cipher_output(json_encode($data)));
+	} else 
+		$json=json_encode(cipher_output($data),  JSON_PRETTY_PRINT);
+//		$json=json_encode(cipher_output($data));
+	
+*/	
+
+function deploy_jsondata($path, $data, $check_same=1, $compress=FALSE, $ignore=FALSE) {
+	$d=json_encode($data, JSON_PRETTY_PRINT);
+	if ($compress) {
+		$path.='.gz';
+		$json=gzencode(cipher_output(json_encode($data, JSON_PRETTY_PRINT)));
+	} else 
+		$json=json_encode(cipher_output($data),  JSON_PRETTY_PRINT);
+	$ignore ? $ignore=L_DIE : $ignore=0;
+	deploy_data($path, $json, $check_same, $ignore);
+}
+
+// more important, mnore checking :)
+function _get_manifest($resource, $generator_key, $out_root) {
+	global $db;
+	if (!$out_root) tolog("deploy_clound_jsondata: out_root us unset", L_ERR | L_DIE);	
+	if (!$resource) tolog("deploy_clound_jsondata: resource IS NULL", L_ERR | L_DIE);
+	if (!$generator_key) tolog("deploy_clound_jsondata: generator_key IS NULL", L_ERR | L_DIE);
+	$res=$db->tsquery("SELECT * FROM gen_manifest WHERE gm_resource='$resource' AND gm_generator_key='$generator_key'", 'get manifest');
+	if ($res->rowCount()>1) tolog("deploy_clound_jsondata: multipple matching resources occured in gen_manifest, solve generator_key", L_ERR | L_DIE);
+	if (!$m=fetch_o($res)) tolog("manifest id $manifest_id not exists in gen_manifest table", L_ERR | L_DIE);
+	return($m);
+}
+
+
+function deploy_cloud_data($resource, $out_root, $data, $local_path='__use_call_template__', $generator_key_override=NULL, $log_param=L_DIE) {
+	global $db, $generator_key;
+	$generator_key_override ? $gk=$generator_key_override : $gk=$generator_key;
+	$m=_get_manifest($resource, $gk, $out_root);
+	switch ($m->gm_format) {
+		case 'json':
+			$data=json_encode($data, JSON_PRETTY_PRINT);
+			$suffix='.json';
+			break;								
+		case 'txt':
+			$suffix='.txt';
+			break;					
+		case 'html':
+			$suffix='.html';
+			break;
+		case 'status':
+		case 'bin':
+		default:
+			$suffix='';
+	}
+	switch ($m->gm_transport) {
+		case 'gz':
+			$suffix.='.gz';
+			$data=gzencode($data);
+			break;
+	}
+//echo "$local_path\n";
+
+	if ($local_path=='__use_call_template__') $path=$out_root.'/'.$m->gm_local_path.$m->gm_call_template;
+	else $path=$out_root.'/'.$m->gm_local_path.$local_path.$suffix;
+	if (deploy_data($path, $data, TRUE, L_DIE)) {
+		tolog("new version of $resource ($local_path), writing change to cloud_deployment table", L_DEBUG);
+		if ($m->gm_cloud_versions) {
+			db_trivialquery("INSERT INTO cloud_deployment SET
+				cld_manifest_id=$m->gm_id, cld_localpart='$local_path$suffix', cld_sequence=1
+				ON DUPLICATE KEY update cld_sequence=cld_sequence+1", 'update cloud deploy data');
+		}
+	}
+}
+
+// old, deprecated
+function deploy_clound_jsondata($resource, $out_root, $local_path, $data, $compress=FALSE, $generator_key_override=NULL, $ignore=FALSE) {
+	global $db, $generator_key;
+	$generator_key_override ? $gk=$generator_key_override : $gk=$generator_key;
+	$m=_get_manifest($resource, $gk, $out_root);
+	if ($local_path=='__use_call_template__') $local_path=$m->gm_call_template;
+	$path=$out_root.'/'.$m->gm_local_path.$local_path;
+	if (deploy_jsondata($path, $data, TRUE, $compress, $ignore)) {
+		tolog("new version of $resource ($local_path), writing change to cloud_deployment table", L_DEBUG);
+		db_trivialquery("INSERT INTO cloud_deployment SET
+			cld_manifest_id=$m->gm_id, cld_localpart='$local_path', cld_sequence=1
+			ON DUPLICATE KEY update cld_sequence=cld_sequence+1", 'update cloud deploy data');
+	}
+}
+
+function remove_cloud_old_content($resource, $out_root, $older_than_days=NULL) {
+	global $db, $generator_key;
+	$m=_get_manifest($resource, $generator_key, $out_root);
+	if (!$older_than_days) 
+		$older_than_days=db_trivialquery("SELECT DATEDIFF(CURDATE(), DATE_ADD(CURDATE(), INTERVAL $m->gm_cloud_remove_after", 'get gm_cloud_remove_after');
+	if (!$older_than_days) tolog("resource $resource older_than_days=0? thats error, stop now", L_ERR | L_DIE);
+	
+	$path="$out_root/$m->gm_local_path/";
+	tolog("removing old content in $path...", L_INFO);
+	exec ("find $out_root/bychannel/ -mtime +$older_than_days -exec rm -r {} \;");
+}
+	
